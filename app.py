@@ -4,32 +4,36 @@ import io
 import re
 import random
 import zipfile
-import copy
+import string
 
-# --- CẤU HÌNH GIAO DIỆN CHUẨN ---
-st.set_page_config(page_title="TNMix - GV Nguyễn Văn Hà", layout="centered")
+# --- CẤU HÌNH GIAO DIỆN THEO MẪU ---
+st.set_page_config(page_title="TNMix Pro - GV Nguyễn Văn Hà", layout="centered")
 
 st.markdown("""
     <style>
     [data-testid="stAppViewContainer"] { background: linear-gradient(180deg, #f3605f 0%, #f9a066 100%); }
-    .main-container { background-color: white; border-radius: 30px; padding: 30px; margin-top: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.2); }
+    .main-container { background-color: white; border-radius: 30px; padding: 30px; margin-top: 10px; box-shadow: 0 10px 30px rgba(0,0,0,0.2); }
+    .logo-badge { background: rgba(255,255,255,0.3); padding: 10px 20px; border-radius: 15px; color: white; font-weight: bold; text-align: center; width: fit-content; margin: auto; }
     .teacher-info { text-align: center; color: white; margin-top: 10px; font-size: 1.1em; }
-    div.stButton > button:first-child[kind="primary"] { background: linear-gradient(90deg, #f3605f, #f9a066); color: white; border: none; border-radius: 25px; height: 50px; width: 100%; font-weight: bold; }
+    div.stButton > button:first-child[kind="primary"] { background: linear-gradient(90deg, #f3605f, #f9a066); color: white; border: none; border-radius: 25px; height: 50px; width: 100%; font-weight: bold; font-size: 18px; }
+    .upload-area { border: 2px solid #f3605f; border-radius: 20px; padding: 40px; text-align: center; background-color: #fffafb; color: #555; }
     </style>
     """, unsafe_allow_html=True)
 
-# --- HÀM SAO CHÉP ĐỊNH DẠNG (GIỮ HÌNH ẢNH & CÔNG THỨC) ---
-def copy_para_format(source_para, target_doc):
-    """Sao chép nguyên khối paragraph bao gồm cả hình ảnh và công thức xml"""
+# --- HÀM SAO CHÉP AN TOÀN ---
+def copy_paragraph_safely(source_para, target_doc):
+    """Sao chép paragraph sang file mới mà không làm hỏng cấu trúc Word"""
     new_para = target_doc.add_paragraph()
+    new_para.paragraph_format.alignment = source_para.alignment
     for run in source_para.runs:
-        new_run = new_para.add_run(run.text)
-        # Sao chép định dạng cơ bản
+        new_run = new_para.add_run()
+        # Sao chép text và định dạng
+        new_run.text = run.text
         new_run.bold = run.bold
         new_run.italic = run.italic
         new_run.underline = run.underline
-        # Sao chép các thành phần XML (Hình ảnh, Công thức)
-        new_para._p.append(copy.deepcopy(run._r))
+        # Sao chép các thành phần nội dung khác (hình ảnh/công thức) qua XML thô
+        new_run._r.append(run._r) if not run.text else None
     return new_para
 
 # --- LOGIC PHÂN TÁCH ĐỀ ---
@@ -46,21 +50,21 @@ def parse_exam_2025(file_stream):
         if "PHẦN III" in text: current_part = "PHẦN III"; continue
 
         if current_part:
-            # Nhận diện câu hỏi
             if re.match(r'^CÂU \d+[:.]', text):
                 if current_q: parts[current_part].append(current_q)
                 current_q = [para]
-            elif current_q or text:
+            elif current_q:
                 current_q.append(para)
     
     if current_q: parts[current_part].append(current_q)
     return parts
 
-# --- TẠO ĐỀ MỚI ---
-def generate_code(parts, code_name):
+# --- TẠO ĐỀ VÀ BẢNG ĐÁP ÁN ---
+def generate_exam_package(parts, code):
     new_doc = Document()
-    new_doc.add_heading(f"MÃ ĐỀ: {code_name}", 0)
-    
+    new_doc.add_heading(f"MÃ ĐỀ: {code}", 0)
+    ans_key = {"I": [], "II": [], "III": []}
+
     for p_label in ["PHẦN I", "PHẦN II", "PHẦN III"]:
         if not parts[p_label]: continue
         new_doc.add_heading(p_label, level=1)
@@ -69,49 +73,62 @@ def generate_code(parts, code_name):
         random.shuffle(shuffled_qs)
 
         for i, q_paras in enumerate(shuffled_qs, 1):
-            # Sửa số thứ tự câu mà không làm mất định dạng
-            first_para = q_paras[0]
-            new_p = new_doc.add_paragraph()
-            # Thay thế text "Câu X" bằng "Câu i"
-            label_text = f"Câu {i}: "
-            content_text = re.sub(r'^Câu \d+[:.]', '', first_para.text, flags=re.I).strip()
-            new_p.add_run(label_text).bold = True
-            new_p.add_run(content_text)
-            
-            # Chép các paragraph còn lại của câu đó (hình ảnh, đáp án...)
-            for p in q_paras[1:]:
-                new_p_extra = new_doc.add_paragraph()
-                new_p_extra._p.append(copy.deepcopy(p._p))
+            # Paragraph đầu tiên (Thân câu hỏi)
+            q_head = new_doc.add_paragraph()
+            q_head.add_run(f"Câu {i}: ").bold = True
+            # Lấy nội dung sau chữ "Câu X:"
+            raw_text = re.sub(r'^Câu \d+[:.]', '', q_paras[0].text, flags=re.I).strip()
+            q_head.add_run(raw_text)
 
-    buf = io.BytesIO()
-    new_doc.save(buf)
-    buf.seek(0)
-    return buf
+            if p_label == "PHẦN I":
+                options = []
+                for p in q_paras[1:]:
+                    if not p.text.strip(): continue
+                    is_correct = any(run.underline for run in p.runs)
+                    opt_content = re.sub(r'^[A-D][\.\)\s]+', '', p.text.strip()).strip()
+                    options.append({'para': p, 'correct': is_correct, 'content': opt_content})
+                
+                random.shuffle(options)
+                for j, opt in enumerate(options):
+                    label = string.ascii_uppercase[j]
+                    new_p = new_doc.add_paragraph(f"{label}. {opt['content']}")
+                    if opt['correct']: ans_key["I"].append(label)
+            else:
+                # Phần II và III giữ nguyên nội dung
+                for p in q_paras[1:]:
+                    new_doc.add_paragraph(p.text)
+
+    buf = io.BytesIO(); new_doc.save(buf); buf.seek(0)
+    return buf, ans_key
 
 # --- GIAO DIỆN ---
-st.markdown("<h2 style='text-align:center; color:white;'>TNMix Pro - Nguyễn Văn Hà</h2>", unsafe_allow_html=True)
+st.markdown('<div class="logo-badge">TNMix</div>', unsafe_allow_html=True)
+st.markdown("<h2 style='text-align:center; color:white; margin-bottom:0;'>TNMix Pro - Nguyễn Văn Hà</h2>", unsafe_allow_html=True)
 st.markdown(f'<div class="teacher-info">Zalo: 0907781595</div>', unsafe_allow_html=True)
 
-uploaded_file = st.file_uploader("Tải file đề .docx", type=["docx"], label_visibility="collapsed")
-
-if uploaded_file:
-    file_content = io.BytesIO(uploaded_file.read())
-    num_codes = st.number_input("Số mã đề:", 1, 10, 4)
+with st.container():
+    st.markdown('<div class="main-container">', unsafe_allow_html=True)
+    uploaded_file = st.file_uploader("Upload file .docx", type=["docx"], label_visibility="collapsed")
     
-    if st.button("BẮT ĐẦU TRỘN ĐỀ", type="primary"):
-        with st.spinner("Đang xử lý hình ảnh và công thức..."):
-            parts = parse_exam_2025(file_content)
+    if not uploaded_file:
+        st.markdown('<div class="upload-area">Kéo thả file .docx vào đây</div>', unsafe_allow_html=True)
+    
+    if uploaded_file:
+        num = st.number_input("Số lượng mã đề:", 1, 10, 4)
+        if st.button("BẮT ĐẦU TRỘN ĐỀ", type="primary"):
+            file_bytes = uploaded_file.read()
+            parts = parse_exam_2025(io.BytesIO(file_bytes))
             
-            # Kiểm tra dữ liệu
             if not any(parts.values()):
-                st.error("Lỗi: Không tìm thấy câu hỏi! Hãy kiểm tra định dạng 'Câu 1:', 'Câu 2:'")
+                st.error("Dữ liệu trống! Hãy kiểm tra từ khóa 'Câu 1:', 'PHẦN I'...")
             else:
                 zip_buf = io.BytesIO()
                 with zipfile.ZipFile(zip_buf, "a") as zf:
-                    for i in range(num_codes):
-                        c_name = 1201 + i
-                        out_doc = generate_code(parts, str(c_name))
-                        zf.writestr(f"De_{c_name}.docx", out_doc.getvalue())
+                    for i in range(num):
+                        code = 1201 + i
+                        doc_file, keys = generate_exam_package(parts, code)
+                        zf.writestr(f"De_{code}.docx", doc_file.getvalue())
                 
                 st.success("Trộn đề thành công!")
-                st.download_button("📥 TẢI FILE ZIP", zip_buf.getvalue(), "KetQua_ThayHa.zip")
+                st.download_button("📥 TẢI TRỌN BỘ (.ZIP)", zip_buf.getvalue(), "TNMix_ThayHa.zip")
+    st.markdown('</div>', unsafe_allow_html=True)
