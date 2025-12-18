@@ -1,14 +1,10 @@
 import streamlit as st
 from docx import Document
-import io
-import re
-import random
-import zipfile
-import string
+from docx.oxml import OxmlElement
+import io, re, random, zipfile, string, copy
 
-# --- GIAO DIỆN THEO HÌNH MẪU ---
+# --- GIAO DIỆN THEO MẪU ---
 st.set_page_config(page_title="TNMix Pro - GV Nguyễn Văn Hà", layout="centered")
-
 st.markdown("""
     <style>
     [data-testid="stAppViewContainer"] { background: linear-gradient(180deg, #f3605f 0%, #f9a066 100%); }
@@ -19,102 +15,109 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# --- LOGIC NHẬN DIỆN DỮ LIỆU LINH HOẠT ---
-def parse_exam_flexible(file_stream):
+# --- HÀM SAO CHÉP ĐOẠN VĂN GIỮ NGUYÊN HÌNH ẢNH ---
+def copy_para_full(source_para, target_doc):
+    new_p = target_doc.add_paragraph()
+    new_p._p.append(copy.deepcopy(source_para._p))
+    # Loại bỏ nội dung cũ để dán đè XML mới tránh bị lặp
+    for p in new_p._p.xpath("./w:p"):
+        if p != new_p._p: new_p._p.remove(p)
+    return new_p
+
+# --- LOGIC NHẬN DIỆN 3 PHẦN ---
+def parse_exam_v3(file_stream):
     doc = Document(file_stream)
-    parts = {"PHẦN I": [], "PHẦN II": [], "PHẦN III": []}
+    parts = {"I": [], "II": [], "III": []}
     current_part = None
     current_q = []
 
     for para in doc.paragraphs:
-        text = para.text.strip()
-        if not text: continue
-        
-        # 1. Nhận diện chuyển phần (không phân biệt hoa thường, dấu chấm)
-        text_up = text.upper()
-        if "PHẦN I" in text_up: current_part = "PHẦN I"; continue
-        if "PHẦN II" in text_up: current_part = "PHẦN II"; continue
-        if "PHẦN III" in text_up: current_part = "PHẦN III"; continue
+        txt = para.text.strip().upper()
+        if "PHẦN I" in txt: current_part = "I"; continue
+        elif "PHẦN II" in txt: current_part = "II"; continue
+        elif "PHẦN III" in txt: current_part = "III"; continue
 
         if current_part:
-            # 2. Nhận diện câu hỏi mới:
-            # - Bắt đầu bằng "Câu X:" 
-            # - HOẶC bắt đầu bằng nội dung mà paragraph tiếp theo là các lựa chọn A, B, C, D
-            is_new_q = re.match(r'^Câu \d+[:.]', text, re.I) 
-            
-            # Đối với file của thầy (không có chữ Câu 1), ta nhận diện khi gặp nội dung mới 
-            # sau khi đã kết thúc đáp án của câu trước.
-            if is_new_q:
+            # Nhận diện câu (Câu 1: hoặc 1.)
+            if re.match(r'^(Câu|Câu hỏi)\s+\d+[:.]', para.text.strip(), re.I):
                 if current_q: parts[current_part].append(current_q)
                 current_q = [para]
-            else:
-                # Nếu là PHẦN I và dòng này chứa A. B. C. D. thì nó thuộc câu đang xét
-                if current_part == "PHẦN I" and re.search(r'[A-D][\.\)]', text):
-                    current_q.append(para)
-                # Nếu là dòng chữ bình thường và chưa có câu nào hoặc câu trước đã có đáp án
-                elif not current_q or (current_part == "PHẦN I" and any(re.search(r'[A-D][\.\)]', p.text) for p in current_q)):
-                    if current_q: parts[current_part].append(current_q)
-                    current_q = [para]
-                else:
-                    current_q.append(para)
-    
+            elif current_q: current_q.append(para)
+            elif para.text.strip(): current_q = [para] # Trường hợp câu đầu tiên không có chữ "Câu"
+            
     if current_q: parts[current_part].append(current_q)
     return parts
 
-def generate_exam(parts, code):
-    new_doc = Document()
-    new_doc.add_heading(f"MÃ ĐỀ: {code}", 0)
-    
-    for p_label, questions in parts.items():
-        if not questions: continue
-        new_doc.add_heading(p_label, level=1)
-        
-        shuffled_qs = list(questions)
-        random.shuffle(shuffled_qs)
+# --- TẠO ĐỀ VÀ ĐÁP ÁN ---
+def create_exam_with_key(parts, code):
+    doc = Document()
+    doc.add_heading(f"MÃ ĐỀ: {code}", 0)
+    keys = {"I": [], "II": [], "III": []}
 
-        for i, q_paras in enumerate(shuffled_qs, 1):
-            # Paragraph đầu tiên làm thân câu hỏi
-            new_p = new_doc.add_paragraph()
-            new_p.add_run(f"Câu {i}: ").bold = True
-            
-            # Xử lý nội dung câu hỏi (bỏ chữ Câu cũ nếu có)
-            body_text = re.sub(r'^Câu \d+[:.]', '', q_paras[0].text, flags=re.I).strip()
-            new_p.add_run(body_text)
+    for p_label, p_key in [("PHẦN I", "I"), ("PHẦN II", "II"), ("PHẦN III", "III")]:
+        if not parts[p_key]: continue
+        doc.add_heading(p_label, level=1)
+        qs = list(parts[p_key])
+        random.shuffle(qs)
 
-            # Chép các paragraph còn lại (Hình ảnh, công thức, đáp án)
+        for i, q_paras in enumerate(qs, 1):
+            # Thân câu hỏi
+            p0 = doc.add_paragraph()
+            p0.add_run(f"Câu {i}: ").bold = True
+            body = re.sub(r'^(Câu|Câu hỏi)\s+\d+[:.]', '', q_paras[0].text, flags=re.I).strip()
+            p0.add_run(body)
+
+            # Nội dung đi kèm (Hình ảnh, đáp án)
             for p in q_paras[1:]:
-                target_p = new_doc.add_paragraph()
-                for run in p.runs:
-                    new_run = target_p.add_run(run.text)
-                    new_run.bold, new_run.italic, new_run.underline = run.bold, run.italic, run.underline
-                    # Đưa hình ảnh/công thức vào XML
-                    if not run.text:
-                        target_p._p.append(run._r)
-
-    buf = io.BytesIO(); new_doc.save(buf); buf.seek(0)
-    return buf
+                # Lưu đáp án nếu có gạch chân (Phần I)
+                if p_key == "I":
+                    for run in p.runs:
+                        if run.underline and re.match(r'^[A-D]', run.text.strip()):
+                            keys["I"].append(f"{i}-{run.text.strip()[0]}")
+                # Lưu key phần III nếu có thẻ <key=...>
+                if p_key == "III":
+                    match = re.search(r'<key=(.*?)>', p.text)
+                    if match: keys["III"].append(f"{i}-{match.group(1)}")
+                
+                # Copy nguyên paragraph (Giữ hình ảnh)
+                new_p = doc.add_paragraph()
+                new_p._p.append(copy.deepcopy(p._p))
+    
+    buf = io.BytesIO(); doc.save(buf); buf.seek(0)
+    return buf, keys
 
 # --- GIAO DIỆN ---
 st.markdown('<div class="logo-badge">TNMix</div>', unsafe_allow_html=True)
 st.markdown("<h2 style='text-align:center; color:white;'>TNMix Pro - Nguyễn Văn Hà</h2>", unsafe_allow_html=True)
 st.markdown(f'<div class="teacher-info">Zalo: 0907781595</div>', unsafe_allow_html=True)
 
-uploaded_file = st.file_uploader("Upload file .docx", type=["docx"], label_visibility="collapsed")
-
-if uploaded_file:
-    file_bytes = uploaded_file.read()
-    parts = parse_exam_flexible(io.BytesIO(file_bytes))
+with st.container():
+    st.markdown('<div class="main-container">', unsafe_allow_html=True)
+    uploaded = st.file_uploader("Chọn file đề gốc .docx", type=["docx"], label_visibility="collapsed")
     
-    if not any(parts.values()):
-        st.error("Dữ liệu trống! Hãy đảm bảo file có chữ 'PHẦN I' và các đáp án 'A.', 'B.'...")
-    else:
+    if uploaded:
         num = st.number_input("Số mã đề:", 1, 10, 4)
         if st.button("BẮT ĐẦU TRỘN ĐỀ", type="primary"):
+            parts = parse_exam_v3(io.BytesIO(uploaded.read()))
             zip_buf = io.BytesIO()
+            all_keys = []
+
             with zipfile.ZipFile(zip_buf, "a") as zf:
                 for i in range(num):
-                    code = 1201 + i
-                    doc_buf = generate_exam(parts, code)
-                    zf.writestr(f"De_{code}.docx", doc_buf.getvalue())
-            st.success("Thành công!")
-            st.download_button("📥 TẢI FILE ZIP", zip_buf.getvalue(), "TNMix_ThayHa.zip")
+                    c = 1201 + i
+                    d_buf, k = create_exam_with_key(parts, c)
+                    zf.writestr(f"De_{c}.docx", d_buf.getvalue())
+                    all_keys.append((c, k))
+                
+                # Tạo file đáp án tổng hợp giống mẫu
+                key_doc = Document()
+                key_doc.add_heading("BẢNG ĐÁP ÁN TỔNG HỢP", 1)
+                for c, k in all_keys:
+                    key_doc.add_paragraph(f"MÃ ĐỀ {c}: " + ", ".join(k["I"] + k["III"]))
+                
+                k_buf = io.BytesIO(); key_doc.save(k_buf); k_buf.seek(0)
+                zf.writestr("DapAn_TongHop.docx", k_buf.getvalue())
+
+            st.success("Thành công! Hình ảnh và công thức đã được giữ nguyên.")
+            st.download_button("📥 TẢI TRỌN BỘ (.ZIP)", zip_buf.getvalue(), "KetQua_TNMix.zip")
+    st.markdown('</div>', unsafe_allow_html=True)
